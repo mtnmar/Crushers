@@ -76,8 +76,8 @@ def to_excel_bytes(dfout: pd.DataFrame, sheet_name="Parts") -> bytes:
         dfout.to_excel(xw, index=False, sheet_name=sheet_name)
         ws = xw.sheets.get(sheet_name)
         if ws:
-            # widths tuned for: Page | Item No | QTY | Part No | Part Name | InStk | Asset
-            for idx, width in enumerate([10, 14, 8, 18, 36, 30, 18], start=1):
+            # widths tuned for: Page | Item No | QTY | Part No | Part Name | InStk
+            for idx, width in enumerate([10, 14, 8, 18, 36, 30], start=1):
                 try:
                     ws.set_column(idx-1, idx-1, width)
                 except Exception:
@@ -90,9 +90,9 @@ def word_bytes_from_rows(dfq: pd.DataFrame, df_all: pd.DataFrame,
     """Create a .docx with:
        - Heading + Generated timestamp
        - Assets table (Asset • Model • Serial) for all assets in dfq
-       - Parts table (Asset • Page • Item Number • Part Number • Part Name • QTY)
+       - Parts table (NO Asset column): Page • Item Number • Part Number • Part Name • QTY
     """
-    if not DOCX_AVAILABLE:
+    if not DOCX_AVAILABLE or dfq.empty:
         return b""
 
     # Asset metadata table
@@ -103,15 +103,15 @@ def word_bytes_from_rows(dfq: pd.DataFrame, df_all: pd.DataFrame,
         try:
             rows = df_all[df_all[col_asset].astype(str) == a]
             if not rows.empty:
-                if col_model:  row["Model"]  = str(rows.iloc[0][col_model]) if pd.notna(rows.iloc[0][col_model]) else ""
-                if col_serial: row["Serial"] = str(rows.iloc[0][col_serial]) if pd.notna(rows.iloc[0][col_serial]) else ""
+                if col_model and pd.notna(rows.iloc[0][col_model]):  row["Model"]  = str(rows.iloc[0][col_model])
+                if col_serial and pd.notna(rows.iloc[0][col_serial]): row["Serial"] = str(rows.iloc[0][col_serial])
         except Exception:
             pass
         meta_rows.append(row)
     meta_df = pd.DataFrame(meta_rows, columns=["Asset","Model","Serial"])
 
-    # Parts table columns
-    cols_needed = ["Asset","Page","Item Number","Part Number","Part Name","QTY"]
+    # Parts table (no Asset column)
+    cols_needed = ["Page","Item Number","Part Number","Part Name","QTY"]
     df_parts = dfq.copy()
     for c in cols_needed:
         if c not in df_parts.columns:
@@ -136,7 +136,7 @@ def word_bytes_from_rows(dfq: pd.DataFrame, df_all: pd.DataFrame,
             cells[2].text = str(r["Serial"]) if pd.notna(r["Serial"]) else ""
         doc.add_paragraph("")
 
-    # Parts section
+    # Parts section (no Asset column)
     doc.add_heading("Requested Parts", level=2)
     t2 = doc.add_table(rows=1, cols=len(cols_needed))
     hdr2 = t2.rows[0].cells
@@ -144,12 +144,11 @@ def word_bytes_from_rows(dfq: pd.DataFrame, df_all: pd.DataFrame,
         hdr2[i].text = col
     for _, r in df_parts.iterrows():
         cells = t2.add_row().cells
-        cells[0].text = str(r["Asset"])
-        cells[1].text = str(r["Page"])
-        cells[2].text = str(r["Item Number"])
-        cells[3].text = str(r["Part Number"])
-        cells[4].text = str(r["Part Name"])
-        cells[5].text = str(r["QTY"])
+        cells[0].text = str(r["Page"])
+        cells[1].text = str(r["Item Number"])
+        cells[2].text = str(r["Part Number"])
+        cells[3].text = str(r["Part Name"])
+        cells[4].text = str(r["QTY"])
 
     bio = io.BytesIO()
     doc.save(bio)
@@ -250,6 +249,7 @@ f = (df[col_asset].astype(str) == str(sel_asset))
 if sel_page != "All":
     f &= (df[col_page].astype(str) == str(sel_page))
 
+# Keep Asset internally, but don't display it
 view = df.loc[f, [col_asset, col_page, col_item, col_qty, col_pn, col_name, col_instk]].copy()
 view.rename(columns={
     col_asset: "Asset",
@@ -273,8 +273,8 @@ view["_page_sort"] = view["Page"].map(to_int_or_nan)
 view["_item_sort"] = view["Item Number"].map(to_int_or_nan)
 view = view.sort_values(by=["_page_sort", "Page", "_item_sort", "Item Number"]).drop(columns=["_page_sort", "_item_sort"])
 
-# Editable selection column
-view_disp = view.copy()
+# ---------- Display table WITHOUT Asset ----------
+view_disp = view.drop(columns=["Asset"]).copy()
 view_disp.insert(0, "Select", False)
 
 st.subheader(f"Parts for: {sel_asset}")
@@ -284,7 +284,6 @@ edited = st.data_editor(
     use_container_width=True,
     column_config={
         "Select": st.column_config.CheckboxColumn("Select"),
-        "Asset": st.column_config.TextColumn("Asset"),
         "Page": st.column_config.TextColumn("Page"),
         "Item Number": st.column_config.TextColumn("Item Number"),
         "QTY": st.column_config.NumberColumn("QTY"),
@@ -292,11 +291,16 @@ edited = st.data_editor(
         "Part Name": st.column_config.TextColumn("Part Name"),
         "InStk": st.column_config.TextColumn("InStk"),
     },
-    disabled=["Asset", "Page", "Item Number", "QTY", "Part Number", "Part Name", "InStk"]
+    disabled=["Page", "Item Number", "QTY", "Part Number", "Part Name", "InStk"]
 )
 
 # ==================== Quote cart (multi-page / multi-asset) ====================
-sel_rows_now = edited[edited["Select"]].drop(columns=["Select"]).copy()
+# edited doesn't include Asset; map selected rows back to 'view' to reattach Asset
+sel_rows_now_display = edited[edited["Select"]].drop(columns=["Select"]).copy()
+
+# Merge back to recover Asset (use a robust key set)
+merge_keys = ["Page","Item Number","Part Number","Part Name","QTY","InStk"]
+sel_rows_now = pd.merge(sel_rows_now_display, view, on=merge_keys, how="left")
 
 if "quote_cart" not in st.session_state:
     st.session_state.quote_cart = pd.DataFrame(columns=["Asset","Page","Item Number","Part Number","Part Name","QTY","InStk"])
@@ -321,14 +325,14 @@ with c_cart2:
 with c_cart3:
     st.caption(f"Cart items: **{len(st.session_state.quote_cart)}**")
 
-with st.expander("View quote cart"):
+with st.expander("View quote cart (internal Asset kept, not shown in quote rows)"):
     st.dataframe(st.session_state.quote_cart, hide_index=True, use_container_width=True)
 
 # Build rows for export: prefer cart if not empty; else current selection
 rows_for_quote = st.session_state.quote_cart.copy() if not st.session_state.quote_cart.empty else sel_rows_now.copy()
 
 # ==================== Downloads ====================
-# 1) Generate Quote (Word) — one click .docx
+# 1) Generate Quote (Word) — one click .docx (NO Asset column in parts table)
 if DOCX_AVAILABLE:
     word_bytes = word_bytes_from_rows(rows_for_quote, df, col_asset, col_model, col_serial) if not rows_for_quote.empty else b""
     base_name = f"QuoteRequest_{sanitize_filename(sel_asset)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -342,9 +346,10 @@ if DOCX_AVAILABLE:
 else:
     st.warning("Word export requires `python-docx`. Add it to requirements.txt.")
 
-# 2) Download Current View (Excel) — always available
-current_view_xlsx = to_excel_bytes(view, sheet_name="Parts")
+# 2) Download Current View (Excel) — exports what you see (NO Asset column)
+current_view_xlsx = to_excel_bytes(view_disp.drop(columns=["Select"]), sheet_name="Parts")
 st.download_button("Download Current View (Excel)",
                    data=current_view_xlsx,
                    file_name=f"Parts_{sanitize_filename(sel_asset)}.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
