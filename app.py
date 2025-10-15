@@ -63,6 +63,21 @@ def github_raw_url(asset_name: str) -> str:
     rel = (MANUALS_DIR / (sanitize_filename(asset_name) + ".pdf")).as_posix()
     return f"https://raw.githubusercontent.com/{GH_OWNER}/{GH_REPO}/{GH_BRANCH}/{rel}"
 
+def to_excel_bytes(dfout: pd.DataFrame, sheet_name="Parts") -> bytes:
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="xlsxwriter") as xw:
+        dfout.to_excel(xw, index=False, sheet_name=sheet_name)
+        # set nice column widths if sheet present
+        ws = xw.sheets.get(sheet_name)
+        if ws:
+            for idx, width in enumerate([10, 14, 8, 18, 36, 30], start=1):
+                try:
+                    ws.set_column(idx-1, idx-1, width)
+                except Exception:
+                    pass
+    bio.seek(0)
+    return bio.getvalue()
+
 @st.cache_data
 def load_data(_data_path: str, _sheet_name: str | None):
     if _sheet_name:
@@ -109,54 +124,59 @@ if missing:
     st.error(f"Missing required column(s): {', '.join(missing)}\n\nColumns found: {list(df.columns)}")
     st.stop()
 
-# ==================== Controls ====================
+# ==================== Top controls (compact) ====================
 assets = sorted(df[col_asset].dropna().astype(str).unique().tolist())
-sel_asset = st.selectbox("Asset", assets, index=0)
 
-# Manual links/downloads
+# Row: Asset | Page | Page filter | Search parts
+c_asset, c_page, c_pagefilter, c_search = st.columns([1.6, 1.0, 0.9, 2.0])
+
+with c_asset:
+    sel_asset = st.selectbox("Asset", assets, index=0)
+
+# Build page options for selected asset (filtered later by "Page filter")
+pages_for_asset = df.loc[df[col_asset].astype(str)==str(sel_asset), col_page].dropna().astype(str).unique().tolist()
+pages_for_asset = sorted(pages_for_asset, key=lambda x: (to_int_or_nan(x), x))
+
+with c_pagefilter:
+    page_filter = st.text_input("Page filter", value="", placeholder="e.g. 42")
+
+# apply page filter to options list (to keep dropdown short)
+if page_filter:
+    page_opts = [p for p in pages_for_asset if page_filter.lower() in p.lower()]
+else:
+    page_opts = pages_for_asset
+
+with c_page:
+    sel_page = st.selectbox("Page", ["All"] + page_opts, index=0)
+
+with c_search:
+    search_parts = st.text_input("Search parts", value="", placeholder="Part number or name")
+
+# Manual links/downloads (keep tight)
 manual_local  = find_manual_path(sel_asset)
 manual_expect = (MANUALS_DIR / (sanitize_filename(sel_asset) + ".pdf")).as_posix()
 cols_top = st.columns([1, 1, 6])
-
 with cols_top[0]:
     if manual_local and manual_local.exists():
         try:
             pdf_bytes = manual_local.read_bytes()
-            st.download_button(
-                "Download Manual (PDF)",
-                data=pdf_bytes,
-                file_name=manual_local.name,
-                mime="application/pdf"
-            )
+            st.download_button("Manual PDF", data=pdf_bytes,
+                               file_name=manual_local.name, mime="application/pdf")
         except Exception as e:
             st.warning(f"Manual found but couldn't read: {e}")
     else:
-        st.caption("No local manual found.")
-        st.caption(f"Expected: `{manual_expect}`")
-
+        st.caption(f"No local manual. Expected: `{manual_expect}`")
 with cols_top[1]:
     gh_url = github_raw_url(sel_asset)
     if gh_url:
         try:
-            st.link_button("Open Manual (GitHub raw)", gh_url)
+            st.link_button("Manual (GitHub raw)", gh_url)
         except Exception:
-            st.markdown(f"[Open Manual (GitHub raw)]({gh_url})")
-
-# Page filter
-opt = st.radio("Pages", ["All pages", "Specific page"], horizontal=True)
-sel_page = None
-if opt == "Specific page":
-    pages = df.loc[df[col_asset].astype(str)==str(sel_asset), col_page].dropna().astype(str).unique().tolist()
-    pages = sorted(pages, key=lambda x: (to_int_or_nan(x), x))
-    # add a tiny text filter on the options for quicker find
-    pf = st.text_input("Filter pages", value="")
-    if pf:
-        pages = [p for p in pages if pf.lower() in p.lower()]
-    sel_page = st.selectbox("Page", pages, index=0 if pages else None)
+            st.markdown(f"[Manual (GitHub raw)]({gh_url})")
 
 # ==================== View ====================
 f = (df[col_asset].astype(str) == str(sel_asset))
-if sel_page is not None:
+if sel_page != "All":
     f &= (df[col_page].astype(str) == str(sel_page))
 
 view = df.loc[f, [col_page, col_item, col_qty, col_pn, col_name, col_instk]].copy()
@@ -168,6 +188,14 @@ view.rename(columns={
     col_name: "Part Name",
     col_instk: "InStk"
 }, inplace=True)
+
+# Apply "Search parts" across Part Number and Part Name
+if search_parts:
+    sp = search_parts.strip().lower()
+    view = view[
+        view["Part Number"].astype(str).str.lower().str.contains(sp, na=False) |
+        view["Part Name"].astype(str).str.lower().str.contains(sp, na=False)
+    ]
 
 # Sort (numeric-friendly)
 view["_page_sort"] = view["Page"].map(to_int_or_nan)
@@ -203,13 +231,13 @@ hdr = df[df[col_asset].astype(str) == str(sel_asset)]
 model_val  = str(hdr.iloc[0][col_model])  if (col_model and not hdr.empty and pd.notna(hdr.iloc[0][col_model])) else ""
 serial_val = str(hdr.iloc[0][col_serial]) if (col_serial and not hdr.empty and pd.notna(hdr.iloc[0][col_serial])) else ""
 
-c1, c2, c3 = st.columns([1, 1, 6])
+c1, c2, _ = st.columns([1, 1, 6])
 with c1: st.write(f"**Selected rows:** {len(sel_rows)}")
 with c2: gen = st.button("Generate Quote Request")
 
-def quote_csv_bytes(dfq: pd.DataFrame) -> bytes:
+def quote_xlsx_bytes(dfq: pd.DataFrame) -> bytes:
     cols = ["Page", "Item Number", "Part Number", "Part Name", "QTY"]
-    return dfq[cols].to_csv(index=False).encode("utf-8")
+    return to_excel_bytes(dfq[cols], sheet_name="Quote")
 
 def quote_docx_bytes(asset: str, model: str, serial: str, dfq: pd.DataFrame) -> bytes | None:
     try:
@@ -248,10 +276,13 @@ if gen:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         base = f"QuoteRequest_{sanitize_filename(sel_asset)}_{ts}"
 
-        csv_bytes = quote_csv_bytes(sel_rows)
-        st.download_button("Download Quote (CSV)", data=csv_bytes,
-                           file_name=f"{base}.csv", mime="text/csv")
+        # Excel download (.xlsx)
+        xlsx_bytes = quote_xlsx_bytes(sel_rows)
+        st.download_button("Download Quote (Excel)", data=xlsx_bytes,
+                           file_name=f"{base}.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+        # Optional Word download
         docx_bytes = quote_docx_bytes(sel_asset, model_val, serial_val, sel_rows)
         if docx_bytes:
             st.download_button("Download Quote (Word)", data=docx_bytes,
@@ -267,3 +298,4 @@ with st.expander("Debug: manuals present in repo"):
         st.write(files if files else "(none)")
     except Exception as e:
         st.write(f"Error listing manuals: {e}")
+
