@@ -67,7 +67,6 @@ def to_excel_bytes(dfout: pd.DataFrame, sheet_name="Parts") -> bytes:
     bio = io.BytesIO()
     with pd.ExcelWriter(bio, engine="xlsxwriter") as xw:
         dfout.to_excel(xw, index=False, sheet_name=sheet_name)
-        # set nice column widths
         ws = xw.sheets.get(sheet_name)
         if ws:
             for idx, width in enumerate([10, 14, 8, 18, 36, 30], start=1):
@@ -75,6 +74,42 @@ def to_excel_bytes(dfout: pd.DataFrame, sheet_name="Parts") -> bytes:
                     ws.set_column(idx-1, idx-1, width)
                 except Exception:
                     pass
+    bio.seek(0)
+    return bio.getvalue()
+
+def quote_xlsx_bytes(asset: str, model: str, serial: str, dfq: pd.DataFrame) -> bytes:
+    """Two-sheet Excel: Quote rows + Header (Asset/Model/Serial)."""
+    cols = ["Page", "Item Number", "Part Number", "Part Name", "QTY", "InStk", "Asset"]
+    dfq2 = dfq.copy()
+    for c in cols:
+        if c not in dfq2.columns:
+            dfq2[c] = ""
+    order = ["Page", "Item Number", "Part Number", "Part Name", "QTY", "InStk", "Asset"]
+    dfq2 = dfq2[order]
+
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="xlsxwriter") as xw:
+        # Header sheet
+        hdr = pd.DataFrame({
+            "Field": ["Asset", "Model", "Serial", "Generated"],
+            "Value": [asset, model, serial, datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
+        })
+        hdr.to_excel(xw, index=False, sheet_name="Header")
+        ws_hdr = xw.sheets["Header"]
+        try:
+            ws_hdr.set_column(0, 0, 12)
+            ws_hdr.set_column(1, 1, 40)
+        except Exception:
+            pass
+
+        # Quote sheet
+        dfq2.to_excel(xw, index=False, sheet_name="Quote")
+        ws_q = xw.sheets["Quote"]
+        try:
+            for idx, width in enumerate([10, 14, 18, 36, 8, 30, 18], start=1):
+                ws_q.set_column(idx-1, idx-1, width)
+        except Exception:
+            pass
     bio.seek(0)
     return bio.getvalue()
 
@@ -174,14 +209,15 @@ f = (df[col_asset].astype(str) == str(sel_asset))
 if sel_page != "All":
     f &= (df[col_page].astype(str) == str(sel_page))
 
-view = df.loc[f, [col_page, col_item, col_qty, col_pn, col_name, col_instk]].copy()
+view = df.loc[f, [col_page, col_item, col_qty, col_pn, col_name, col_instk, col_asset]].copy()
 view.rename(columns={
     col_page: "Page",
     col_item: "Item Number",
     col_qty: "QTY",
     col_pn: "Part Number",
     col_name: "Part Name",
-    col_instk: "InStk"
+    col_instk: "InStk",
+    col_asset: "Asset"
 }, inplace=True)
 
 if search_parts:
@@ -213,115 +249,70 @@ edited = st.data_editor(
         "Part Number": st.column_config.TextColumn("Part Number"),
         "Part Name": st.column_config.TextColumn("Part Name"),
         "InStk": st.column_config.TextColumn("InStk"),
+        "Asset": st.column_config.TextColumn("Asset"),
     },
-    disabled=["Page", "Item Number", "QTY", "Part Number", "Part Name", "InStk"]
+    disabled=["Page", "Item Number", "QTY", "Part Number", "Part Name", "InStk", "Asset"]
 )
 
-# ==================== Quote request (persistent) ====================
-sel_rows = edited[edited["Select"]].drop(columns=["Select"])
+# ==================== Quote cart (multi-page / multi-asset) ====================
+sel_rows_now = edited[edited["Select"]].drop(columns=["Select"]).copy()
 
+if "quote_cart" not in st.session_state:
+    st.session_state.quote_cart = pd.DataFrame(columns=["Page","Item Number","Part Number","Part Name","QTY","InStk","Asset"])
+
+def add_to_cart(df_add: pd.DataFrame):
+    if df_add.empty:
+        return
+    cart = st.session_state.quote_cart
+    combined = pd.concat([cart, df_add], ignore_index=True)
+    # de-dupe by Asset + Page + Item Number + Part Number
+    dedupe_keys = ["Asset","Page","Item Number","Part Number"]
+    combined = combined.sort_values(dedupe_keys).drop_duplicates(subset=dedupe_keys, keep="last")
+    st.session_state.quote_cart = combined
+
+c_cart1, c_cart2, c_cart3, _ = st.columns([1.2, 1.6, 1.2, 5])
+with c_cart1:
+    if st.button("Add selected to cart", type="primary"):
+        add_to_cart(sel_rows_now)
+with c_cart2:
+    if st.button("Clear cart"):
+        st.session_state.quote_cart = st.session_state.quote_cart.iloc[0:0].copy()
+with c_cart3:
+    st.caption(f"Cart items: **{len(st.session_state.quote_cart)}**")
+
+with st.expander("View quote cart"):
+    st.dataframe(st.session_state.quote_cart, hide_index=True, use_container_width=True)
+
+# ==================== Generate (direct download) ====================
+# Build the rows to export: prefer cart if not empty; otherwise current selection
+if not st.session_state.quote_cart.empty:
+    rows_for_quote = st.session_state.quote_cart.copy()
+else:
+    rows_for_quote = sel_rows_now.copy()
+
+# Pull model/serial (first row under current asset, if present)
 hdr = df[df[col_asset].astype(str) == str(sel_asset)]
 model_val  = str(hdr.iloc[0][col_model])  if (col_model and not hdr.empty and pd.notna(hdr.iloc[0][col_model])) else ""
 serial_val = str(hdr.iloc[0][col_serial]) if (col_serial and not hdr.empty and pd.notna(hdr.iloc[0][col_serial])) else ""
 
-if "quote_ready" not in st.session_state:
-    st.session_state.quote_ready = False
-    st.session_state.quote_rows = None
-    st.session_state.quote_asset = ""
-    st.session_state.quote_model = ""
-    st.session_state.quote_serial = ""
-    st.session_state.quote_ts = ""
+ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+base_name = f"QuoteRequest_{sanitize_filename(sel_asset)}_{ts}"
+xlsx_bytes_now = quote_xlsx_bytes(sel_asset, model_val, serial_val, rows_for_quote) if not rows_for_quote.empty else b""
 
-c1, c2, _ = st.columns([1, 1, 6])
-with c1:
-    st.write(f"**Selected rows:** {len(sel_rows)}")
-with c2:
-    gen = st.button("Generate Quote Request", type="primary")
+# One-click download (Excel). If nothing selected and cart empty, disable.
+st.download_button(
+    "Generate Quote (.xlsx)",
+    data=xlsx_bytes_now if xlsx_bytes_now else b"No items selected",
+    file_name=f"{base_name}.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    disabled=rows_for_quote.empty
+)
 
-def quote_xlsx_bytes(dfq: pd.DataFrame) -> bytes:
-    cols = ["Page", "Item Number", "Part Number", "Part Name", "QTY"]
-    return to_excel_bytes(dfq[cols], sheet_name="Quote")
+# Also offer "Download Current View (Excel)" (whatever you're looking at)
+current_view_xlsx = to_excel_bytes(view, sheet_name="Parts")
+st.download_button("Download Current View (Excel)",
+                   data=current_view_xlsx,
+                   file_name=f"Parts_{sanitize_filename(sel_asset)}.xlsx",
+                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-def quote_docx_bytes(asset: str, model: str, serial: str, dfq: pd.DataFrame) -> bytes | None:
-    try:
-        from docx import Document
-    except Exception:
-        return None
-    doc = Document()
-    doc.add_heading("Quote Request", level=1)
-    p = doc.add_paragraph()
-    p.add_run("Asset: ").bold = True; p.add_run(str(asset))
-    if model:
-        p = doc.add_paragraph(); p.add_run("Model: ").bold = True; p.add_run(str(model))
-    if serial:
-        p = doc.add_paragraph(); p.add_run("Serial: ").bold = True; p.add_run(str(serial))
-    doc.add_paragraph("")
-    table = doc.add_table(rows=1, cols=5)
-    hdr = table.rows[0].cells
-    hdr[0].text = "Page"; hdr[1].text = "Item Number"; hdr[2].text = "Part Number"; hdr[3].text = "Part Name"; hdr[4].text = "QTY"
-    for _, r in dfq.iterrows():
-        row = table.add_row().cells
-        row[0].text = str(r["Page"])
-        row[1].text = str(r["Item Number"])
-        row[2].text = str(r["Part Number"])
-        row[3].text = str(r["Part Name"])
-        row[4].text = str(r["QTY"])
-    bio = io.BytesIO()
-    doc.save(bio)
-    bio.seek(0)
-    return bio.getvalue()
-
-# When clicked, persist selection + metadata for download on subsequent reruns
-if gen:
-    if sel_rows.empty:
-        st.warning("No rows selected. Check the boxes in the left column.")
-    else:
-        st.session_state.quote_ready = True
-        st.session_state.quote_rows = sel_rows[["Page", "Item Number", "Part Number", "Part Name", "QTY"]].copy()
-        st.session_state.quote_asset = sel_asset
-        st.session_state.quote_model = model_val
-        st.session_state.quote_serial = serial_val
-        st.session_state.quote_ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        st.success("Quote prepared below. Use the download buttons.")
-
-# Always offer: download the current filtered table (xlsx)
-dl_cols = st.columns([1, 3, 6])
-with dl_cols[0]:
-    current_view_xlsx = to_excel_bytes(view, sheet_name="Parts")
-    st.download_button("Download Current View (Excel)",
-                       data=current_view_xlsx,
-                       file_name=f"Parts_{sanitize_filename(sel_asset)}.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-# If a quote is ready, show persistent download buttons
-if st.session_state.quote_ready and st.session_state.quote_rows is not None:
-    base = f"QuoteRequest_{sanitize_filename(st.session_state.quote_asset)}_{st.session_state.quote_ts}"
-    qxlsx = quote_xlsx_bytes(st.session_state.quote_rows)
-    colq1, colq2, _ = st.columns([1, 1, 6])
-    with colq1:
-        st.download_button("Download Quote (Excel)",
-                           data= qxlsx,
-                           file_name=f"{base}.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    # Optional Word
-    qdocx = quote_docx_bytes(st.session_state.quote_asset,
-                             st.session_state.quote_model,
-                             st.session_state.quote_serial,
-                             st.session_state.quote_rows)
-    with colq2:
-        if qdocx:
-            st.download_button("Download Quote (Word)",
-                               data=qdocx,
-                               file_name=f"{base}.docx",
-                               mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
-        else:
-            st.caption("Install `python-docx` to enable Word download.")
-
-# Debug helper (optional)
-with st.expander("Debug: manuals present in repo"):
-    try:
-        files = sorted([p.name for p in MANUALS_DIR.glob("*.pdf")])
-        st.write(files if files else "(none)")
-    except Exception as e:
-        st.write(f"Error listing manuals: {e}")
 
