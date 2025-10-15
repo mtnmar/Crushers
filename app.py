@@ -20,6 +20,13 @@ GH_BRANCH = "main"
 st.set_page_config(page_title="Crushers Parts", layout="wide")
 st.title("Crushers Parts")
 
+# Try to import python-docx for Word export
+try:
+    from docx import Document
+    DOCX_AVAILABLE = True
+except Exception:
+    DOCX_AVAILABLE = False
+
 # ==================== Helpers ====================
 def pick_col(df, candidates):
     """Return first matching column (case/spacing tolerant)."""
@@ -69,7 +76,8 @@ def to_excel_bytes(dfout: pd.DataFrame, sheet_name="Parts") -> bytes:
         dfout.to_excel(xw, index=False, sheet_name=sheet_name)
         ws = xw.sheets.get(sheet_name)
         if ws:
-            for idx, width in enumerate([10, 14, 8, 18, 36, 30], start=1):
+            # widths tuned for: Page | Item No | QTY | Part No | Part Name | InStk | Asset
+            for idx, width in enumerate([10, 14, 8, 18, 36, 30, 18], start=1):
                 try:
                     ws.set_column(idx-1, idx-1, width)
                 except Exception:
@@ -77,39 +85,74 @@ def to_excel_bytes(dfout: pd.DataFrame, sheet_name="Parts") -> bytes:
     bio.seek(0)
     return bio.getvalue()
 
-def quote_xlsx_bytes(asset: str, model: str, serial: str, dfq: pd.DataFrame) -> bytes:
-    """Two-sheet Excel: Quote rows + Header (Asset/Model/Serial)."""
-    cols = ["Page", "Item Number", "Part Number", "Part Name", "QTY", "InStk", "Asset"]
-    dfq2 = dfq.copy()
-    for c in cols:
-        if c not in dfq2.columns:
-            dfq2[c] = ""
-    order = ["Page", "Item Number", "Part Number", "Part Name", "QTY", "InStk", "Asset"]
-    dfq2 = dfq2[order]
+def word_bytes_from_rows(dfq: pd.DataFrame, df_all: pd.DataFrame,
+                         col_asset: str, col_model: str | None, col_serial: str | None) -> bytes:
+    """Create a .docx with:
+       - Heading + Generated timestamp
+       - Assets table (Asset • Model • Serial) for all assets in dfq
+       - Parts table (Asset • Page • Item Number • Part Number • Part Name • QTY)
+    """
+    if not DOCX_AVAILABLE:
+        return b""
+
+    # Asset metadata table
+    assets = pd.Series(sorted(dfq["Asset"].astype(str).unique().tolist()))
+    meta_rows = []
+    for a in assets:
+        row = { "Asset": a, "Model": "", "Serial": "" }
+        try:
+            rows = df_all[df_all[col_asset].astype(str) == a]
+            if not rows.empty:
+                if col_model:  row["Model"]  = str(rows.iloc[0][col_model]) if pd.notna(rows.iloc[0][col_model]) else ""
+                if col_serial: row["Serial"] = str(rows.iloc[0][col_serial]) if pd.notna(rows.iloc[0][col_serial]) else ""
+        except Exception:
+            pass
+        meta_rows.append(row)
+    meta_df = pd.DataFrame(meta_rows, columns=["Asset","Model","Serial"])
+
+    # Parts table columns
+    cols_needed = ["Asset","Page","Item Number","Part Number","Part Name","QTY"]
+    df_parts = dfq.copy()
+    for c in cols_needed:
+        if c not in df_parts.columns:
+            df_parts[c] = ""
+    df_parts = df_parts[cols_needed]
+
+    # Build doc
+    doc = Document()
+    doc.add_heading("Quote Request", level=1)
+    doc.add_paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    # Assets section
+    if not meta_df.empty:
+        doc.add_heading("Assets", level=2)
+        t = doc.add_table(rows=1, cols=3)
+        hdr = t.rows[0].cells
+        hdr[0].text = "Asset"; hdr[1].text = "Model"; hdr[2].text = "Serial"
+        for _, r in meta_df.iterrows():
+            cells = t.add_row().cells
+            cells[0].text = str(r["Asset"])
+            cells[1].text = str(r["Model"]) if pd.notna(r["Model"]) else ""
+            cells[2].text = str(r["Serial"]) if pd.notna(r["Serial"]) else ""
+        doc.add_paragraph("")
+
+    # Parts section
+    doc.add_heading("Requested Parts", level=2)
+    t2 = doc.add_table(rows=1, cols=len(cols_needed))
+    hdr2 = t2.rows[0].cells
+    for i, col in enumerate(cols_needed):
+        hdr2[i].text = col
+    for _, r in df_parts.iterrows():
+        cells = t2.add_row().cells
+        cells[0].text = str(r["Asset"])
+        cells[1].text = str(r["Page"])
+        cells[2].text = str(r["Item Number"])
+        cells[3].text = str(r["Part Number"])
+        cells[4].text = str(r["Part Name"])
+        cells[5].text = str(r["QTY"])
 
     bio = io.BytesIO()
-    with pd.ExcelWriter(bio, engine="xlsxwriter") as xw:
-        # Header sheet
-        hdr = pd.DataFrame({
-            "Field": ["Asset", "Model", "Serial", "Generated"],
-            "Value": [asset, model, serial, datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
-        })
-        hdr.to_excel(xw, index=False, sheet_name="Header")
-        ws_hdr = xw.sheets["Header"]
-        try:
-            ws_hdr.set_column(0, 0, 12)
-            ws_hdr.set_column(1, 1, 40)
-        except Exception:
-            pass
-
-        # Quote sheet
-        dfq2.to_excel(xw, index=False, sheet_name="Quote")
-        ws_q = xw.sheets["Quote"]
-        try:
-            for idx, width in enumerate([10, 14, 18, 36, 8, 30, 18], start=1):
-                ws_q.set_column(idx-1, idx-1, width)
-        except Exception:
-            pass
+    doc.save(bio)
     bio.seek(0)
     return bio.getvalue()
 
@@ -164,7 +207,6 @@ assets = sorted(df[col_asset].dropna().astype(str).unique().tolist())
 
 # Row: Asset | Page | Page filter | Search parts
 c_asset, c_page, c_pagefilter, c_search = st.columns([1.6, 1.0, 0.9, 2.0])
-
 with c_asset:
     sel_asset = st.selectbox("Asset", assets, index=0)
 
@@ -175,7 +217,6 @@ with c_pagefilter:
     page_filter = st.text_input("Page filter", value="", placeholder="e.g. 42")
 
 page_opts = [p for p in pages_for_asset if page_filter.lower() in p.lower()] if page_filter else pages_for_asset
-
 with c_page:
     sel_page = st.selectbox("Page", ["All"] + page_opts, index=0)
 
@@ -209,15 +250,15 @@ f = (df[col_asset].astype(str) == str(sel_asset))
 if sel_page != "All":
     f &= (df[col_page].astype(str) == str(sel_page))
 
-view = df.loc[f, [col_page, col_item, col_qty, col_pn, col_name, col_instk, col_asset]].copy()
+view = df.loc[f, [col_asset, col_page, col_item, col_qty, col_pn, col_name, col_instk]].copy()
 view.rename(columns={
+    col_asset: "Asset",
     col_page: "Page",
     col_item: "Item Number",
     col_qty: "QTY",
     col_pn: "Part Number",
     col_name: "Part Name",
-    col_instk: "InStk",
-    col_asset: "Asset"
+    col_instk: "InStk"
 }, inplace=True)
 
 if search_parts:
@@ -243,29 +284,29 @@ edited = st.data_editor(
     use_container_width=True,
     column_config={
         "Select": st.column_config.CheckboxColumn("Select"),
+        "Asset": st.column_config.TextColumn("Asset"),
         "Page": st.column_config.TextColumn("Page"),
         "Item Number": st.column_config.TextColumn("Item Number"),
         "QTY": st.column_config.NumberColumn("QTY"),
         "Part Number": st.column_config.TextColumn("Part Number"),
         "Part Name": st.column_config.TextColumn("Part Name"),
         "InStk": st.column_config.TextColumn("InStk"),
-        "Asset": st.column_config.TextColumn("Asset"),
     },
-    disabled=["Page", "Item Number", "QTY", "Part Number", "Part Name", "InStk", "Asset"]
+    disabled=["Asset", "Page", "Item Number", "QTY", "Part Number", "Part Name", "InStk"]
 )
 
 # ==================== Quote cart (multi-page / multi-asset) ====================
 sel_rows_now = edited[edited["Select"]].drop(columns=["Select"]).copy()
 
 if "quote_cart" not in st.session_state:
-    st.session_state.quote_cart = pd.DataFrame(columns=["Page","Item Number","Part Number","Part Name","QTY","InStk","Asset"])
+    st.session_state.quote_cart = pd.DataFrame(columns=["Asset","Page","Item Number","Part Number","Part Name","QTY","InStk"])
 
 def add_to_cart(df_add: pd.DataFrame):
     if df_add.empty:
         return
     cart = st.session_state.quote_cart
     combined = pd.concat([cart, df_add], ignore_index=True)
-    # de-dupe by Asset + Page + Item Number + Part Number
+    # De-dupe by Asset + Page + Item Number + Part Number
     dedupe_keys = ["Asset","Page","Item Number","Part Number"]
     combined = combined.sort_values(dedupe_keys).drop_duplicates(subset=dedupe_keys, keep="last")
     st.session_state.quote_cart = combined
@@ -283,36 +324,27 @@ with c_cart3:
 with st.expander("View quote cart"):
     st.dataframe(st.session_state.quote_cart, hide_index=True, use_container_width=True)
 
-# ==================== Generate (direct download) ====================
-# Build the rows to export: prefer cart if not empty; otherwise current selection
-if not st.session_state.quote_cart.empty:
-    rows_for_quote = st.session_state.quote_cart.copy()
+# Build rows for export: prefer cart if not empty; else current selection
+rows_for_quote = st.session_state.quote_cart.copy() if not st.session_state.quote_cart.empty else sel_rows_now.copy()
+
+# ==================== Downloads ====================
+# 1) Generate Quote (Word) — one click .docx
+if DOCX_AVAILABLE:
+    word_bytes = word_bytes_from_rows(rows_for_quote, df, col_asset, col_model, col_serial) if not rows_for_quote.empty else b""
+    base_name = f"QuoteRequest_{sanitize_filename(sel_asset)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    st.download_button(
+        "Generate Quote (Word)",
+        data=word_bytes if rows_for_quote is not None and not rows_for_quote.empty else b"",
+        file_name=f"{base_name}.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        disabled=rows_for_quote is None or rows_for_quote.empty
+    )
 else:
-    rows_for_quote = sel_rows_now.copy()
+    st.warning("Word export requires `python-docx`. Add it to requirements.txt.")
 
-# Pull model/serial (first row under current asset, if present)
-hdr = df[df[col_asset].astype(str) == str(sel_asset)]
-model_val  = str(hdr.iloc[0][col_model])  if (col_model and not hdr.empty and pd.notna(hdr.iloc[0][col_model])) else ""
-serial_val = str(hdr.iloc[0][col_serial]) if (col_serial and not hdr.empty and pd.notna(hdr.iloc[0][col_serial])) else ""
-
-ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-base_name = f"QuoteRequest_{sanitize_filename(sel_asset)}_{ts}"
-xlsx_bytes_now = quote_xlsx_bytes(sel_asset, model_val, serial_val, rows_for_quote) if not rows_for_quote.empty else b""
-
-# One-click download (Excel). If nothing selected and cart empty, disable.
-st.download_button(
-    "Generate Quote (.xlsx)",
-    data=xlsx_bytes_now if xlsx_bytes_now else b"No items selected",
-    file_name=f"{base_name}.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    disabled=rows_for_quote.empty
-)
-
-# Also offer "Download Current View (Excel)" (whatever you're looking at)
+# 2) Download Current View (Excel) — always available
 current_view_xlsx = to_excel_bytes(view, sheet_name="Parts")
 st.download_button("Download Current View (Excel)",
                    data=current_view_xlsx,
                    file_name=f"Parts_{sanitize_filename(sel_asset)}.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-
