@@ -100,10 +100,10 @@ if missing:
 assets = sorted(df[col_asset].dropna().astype(str).unique().tolist())
 sel_asset = st.selectbox("Asset", assets, index=0)
 
-# Optional manual link/download
 manual_name = sanitize_filename(sel_asset) + ".pdf"
 manual_path = (MANUALS_DIR / manual_name)
 man_cols = st.columns([1, 1, 6])
+
 with man_cols[0]:
     if manual_path.exists():
         try:
@@ -115,12 +115,13 @@ with man_cols[0]:
         except Exception as e:
             st.warning(f"Manual found but couldn't read: {e}")
     else:
-        st.caption(f"Place manual at `{MANUALS_DIR/{manual_name}}` for download")
+        st.caption(f"Place manual at `{(MANUALS_DIR / manual_name).as_posix()}` for download")
 
 with man_cols[1]:
     if GH_OWNER and GH_REPO:
-        gh_url = f"https://raw.githubusercontent.com/{GH_OWNER}/{GH_REPO}/{GH_BRANCH}/{(MANUALS_DIR/manual_name).as_posix()}"
+        gh_url = f"https://raw.githubusercontent.com/{GH_OWNER}/{GH_REPO}/{GH_BRANCH}/{(MANUALS_DIR / manual_name).as_posix()}"
         st.link_button("Open Manual (GitHub raw)", gh_url, disabled=not (GH_OWNER and GH_REPO))
+
 
 # Page filter: All pages or a specific page
 pages_all = df.loc[df[col_asset].astype(str)==str(sel_asset), col_page].dropna()
