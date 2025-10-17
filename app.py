@@ -91,32 +91,15 @@ def word_bytes_from_rows(dfq: pd.DataFrame, df_all: pd.DataFrame,
     """
     Create a .docx with:
       - Heading + Generated timestamp
-      - Vendor (blank line)
-      - Asset header block (Asset • Model • Serial) for each asset in dfq (top of doc)
+      - Vendor placeholder line (no auto Asset/Model/Serial lines)
       - Parts table: Part Number • Part Name • QTY  (+ 10 blank rows)
     """
     if not DOCX_AVAILABLE or dfq.empty:
         return b""
 
-    # Build asset metadata from source sheet
-    assets = pd.Series(sorted(dfq["Asset"].astype(str).unique().tolist()))
-    meta_rows = []
-    for a in assets:
-        row = {"Asset": a, "Model": "", "Serial": ""}
-        try:
-            rows = df_all[df_all[col_asset].astype(str) == a]
-            if not rows.empty:
-                if col_model and pd.notna(rows.iloc[0][col_model]):  row["Model"]  = str(rows.iloc[0][col_model])
-                if col_serial and pd.notna(rows.iloc[0][col_serial]): row["Serial"] = str(rows.iloc[0][col_serial])
-        except Exception:
-            pass
-        meta_rows.append(row)
-    meta_df = pd.DataFrame(meta_rows, columns=["Asset","Model","Serial"])
-
     # Parts table (only the 3 requested columns)
     cols_needed = ["Part Number","Part Name","QTY"]
     df_parts = pd.DataFrame(columns=cols_needed)
-    # dfq already has these renamed columns from the view
     if not dfq.empty:
         for c in cols_needed:
             if c not in dfq.columns:
@@ -139,17 +122,11 @@ def word_bytes_from_rows(dfq: pd.DataFrame, df_all: pd.DataFrame,
 
     doc.add_heading("Quote Request", level=1)
     doc.add_paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    # Vendor left blank for users to fill in
-    doc.add_paragraph("Vendor: ______________________________")
 
-    # Asset block at top
-    if not meta_df.empty:
-        doc.add_paragraph("")  # spacing
-        for _, r in meta_df.iterrows():
-            a = str(r["Asset"]) if pd.notna(r["Asset"]) else ""
-            m = str(r["Model"]) if pd.notna(r["Model"]) else ""
-            s = str(r["Serial"]) if pd.notna(r["Serial"]) else ""
-            doc.add_paragraph(f"Asset: {a}    Model: {m}    Serial: {s}")
+    # Vendor line with placeholder (no Asset/Model/Serial lines)
+    p = doc.add_paragraph("Vendor: ")
+    r = p.add_run("Enter vendor here")
+    r.italic = True
 
     doc.add_paragraph("")  # spacing
     doc.add_heading("Requested Parts", level=2)
@@ -369,10 +346,13 @@ else:
             disabled=["Asset","Page","Item Number","Part Number","Part Name","InStk"],
             key="cart_editor",
         )
-        c_s, c_r, c_c = st.columns([1.2, 1.2, 1.2])
-        save_qty = c_s.form_submit_button("💾 Save Qty", use_container_width=True)
-        remove_it = c_r.form_submit_button("🗑️ Remove selected", use_container_width=True)
-        clear_it  = c_c.form_submit_button("🧼 Clear cart", use_container_width=True)
+        # Buttons in one row: Save, Remove, Clear, Quote, Email (disabled)
+        cs, cr, cc, cq, cm = st.columns([1.15, 1.25, 1.15, 1.6, 1.6])
+        save_qty   = cs.form_submit_button("💾 Save Qty", use_container_width=True)
+        remove_it  = cr.form_submit_button("🗑️ Remove selected", use_container_width=True)
+        clear_it   = cc.form_submit_button("🧼 Clear cart", use_container_width=True)
+        gen_quote  = cq.form_submit_button("🧾 Generate Quote", use_container_width=True)
+        email_soon = cm.form_submit_button("✉️ Email (coming soon)", use_container_width=True, disabled=True)
 
     if save_qty and "QTY" in edited_cart.columns:
         # Persist QTY edits back to the session cart (align by index)
@@ -392,32 +372,34 @@ else:
         st.session_state.quote_cart = st.session_state.quote_cart.iloc[0:0].copy()
         st.rerun()
 
+    # Generate quote in-place: show download button right under the row when clicked
+    if gen_quote:
+        rows_for_quote = st.session_state.quote_cart.copy()
+        if not rows_for_quote.empty and DOCX_AVAILABLE:
+            blob = word_bytes_from_rows(rows_for_quote, df, col_asset, col_model, col_serial)
+            base_name = f"QuoteRequest_{sanitize_filename(sel_asset)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+            st.download_button(
+                "📥 Download Quote (Word)",
+                data=blob,
+                file_name=base_name,
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                use_container_width=True
+            )
+        elif not DOCX_AVAILABLE:
+            st.warning("Word export requires `python-docx`. Add it to requirements.txt.")
+        else:
+            st.info("Cart is empty—add items before generating a quote.")
+
 with st.expander("View raw cart data"):
     st.dataframe(st.session_state.quote_cart, hide_index=True, use_container_width=True)
 
-# Build rows for export: prefer cart; else current selection
-rows_for_quote = st.session_state.quote_cart.copy() if not st.session_state.quote_cart.empty else sel_rows_now.copy()
-
 # ==================== Downloads ====================
-# 1) Generate Quote (Word) — .docx (Parts table = PN | Name | QTY; +10 blank rows; top shows Vendor blank + Asset/Model/Serial)
-if DOCX_AVAILABLE:
-    word_bytes = word_bytes_from_rows(rows_for_quote, df, col_asset, col_model, col_serial) if not rows_for_quote.empty else b""
-    base_name = f"QuoteRequest_{sanitize_filename(sel_asset)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    st.download_button(
-        "Generate Quote (Word)",
-        data=word_bytes if rows_for_quote is not None and not rows_for_quote.empty else b"",
-        file_name=f"{base_name}.docx",
-        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        disabled=rows_for_quote is None or rows_for_quote.empty
-    )
-else:
-    st.warning("Word export requires `python-docx`. Add it to requirements.txt.")
-
-# 2) Download Current View (Excel) — exports what you see (NO Asset column)
+# Download Current View (Excel) — exports what you see (NO Asset column)
 current_view_xlsx = to_excel_bytes(view_disp.drop(columns=["Select"]), sheet_name="Parts")
 st.download_button("Download Current View (Excel)",
                    data=current_view_xlsx,
                    file_name=f"Parts_{sanitize_filename(sel_asset)}.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 
 
