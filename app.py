@@ -98,8 +98,7 @@ def word_bytes_from_rows(dfq: pd.DataFrame, df_all: pd.DataFrame,
     if not DOCX_AVAILABLE or dfq.empty:
         return b""
 
-    # ---- Collect unique, non-null assets from selected rows
-    # (avoid 'nan' strings by dropping NA before astype(str))
+    # Unique, non-null assets from selected rows
     assets = sorted(dfq["Asset"].dropna().astype(str).unique().tolist())
 
     # Pull Model/Serial for each asset from the full dataset
@@ -147,14 +146,14 @@ def word_bytes_from_rows(dfq: pd.DataFrame, df_all: pd.DataFrame,
     r = p.add_run("Enter vendor here")
     r.italic = True
 
-    # Asset header lines (one per asset; no empties)
+    # Asset header lines (no empties, no duplicates)
     if not meta_df.empty:
         doc.add_paragraph("")  # spacing
         for _, r in meta_df.iterrows():
             a = str(r["Asset"]) if pd.notna(r["Asset"]) and str(r["Asset"]).strip() else ""
             m = str(r["Model"]) if pd.notna(r["Model"]) and str(r["Model"]).strip() else ""
             s = str(r["Serial"]) if pd.notna(r["Serial"]) and str(r["Serial"]).strip() else ""
-            if a:  # only print when we actually have an Asset value
+            if a:
                 doc.add_paragraph(f"Asset: {a}    Model: {m}    Serial: {s}")
 
     doc.add_paragraph("")  # spacing
@@ -194,10 +193,18 @@ def load_data(_data_path: str, _sheet_name: str | None):
             used = xls.sheet_names[0]
     return df, used
 
+def file_last_updated_label(path: Path) -> str:
+    try:
+        ts = path.stat().st_mtime
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "unknown"
+
 # ==================== Load sheet ====================
 try:
     df, used_sheet = load_data(str(DATA_PATH), SHEET_NAME)
-    st.caption(f"Loaded sheet: **{used_sheet}** from `{DATA_PATH}`")
+    last = file_last_updated_label(DATA_PATH)
+    st.caption(f"Data file: **{DATA_PATH.name}** • last updated: **{last}** • sheet: **{used_sheet}**")
 except Exception as e:
     st.error(f"Could not open `{DATA_PATH}`: {e}")
     st.stop()
@@ -357,54 +364,32 @@ else:
     cart_view = cart_df.copy()
     cart_view.insert(0, "Remove", False)
 
-    with st.form("cart_form", clear_on_submit=False):
-        edited_cart = st.data_editor(
-            cart_view[["Remove","Asset","Page","Item Number","Part Number","Part Name","QTY","InStk"]],
-            hide_index=True,
-            use_container_width=True,
-            column_config={
-                "Remove": st.column_config.CheckboxColumn("Remove", help="Check to remove selected rows"),
-                "QTY": st.column_config.NumberColumn("QTY", step=1, min_value=0),
-                "Asset": st.column_config.TextColumn("Asset"),
-                "Page": st.column_config.TextColumn("Page"),
-                "Item Number": st.column_config.TextColumn("Item Number"),
-                "Part Number": st.column_config.TextColumn("Part Number"),
-                "Part Name": st.column_config.TextColumn("Part Name"),
-                "InStk": st.column_config.TextColumn("InStk"),
-            },
-            disabled=["Asset","Page","Item Number","Part Number","Part Name","InStk"],
-            key="cart_editor",
-        )
-        # Buttons on one row: Save • Remove Item • Clear • Generate
-        cs, cr, cc, cg = st.columns([1.0, 1.4, 1.0, 1.3])
-        save_qty   = cs.form_submit_button("Save", use_container_width=True)
-        remove_it  = cr.form_submit_button("Remove Item", use_container_width=True)
-        clear_it   = cc.form_submit_button("Clear", use_container_width=True)
+    # Editable cart (no form; avoids download_button-in-form error and lets Generate be on same row)
+    edited_cart = st.data_editor(
+        cart_view[["Remove","Asset","Page","Item Number","Part Number","Part Name","QTY","InStk"]],
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Remove": st.column_config.CheckboxColumn("Remove", help="Check to remove selected rows"),
+            "QTY": st.column_config.NumberColumn("QTY", step=1, min_value=0),
+            "Asset": st.column_config.TextColumn("Asset"),
+            "Page": st.column_config.TextColumn("Page"),
+            "Item Number": st.column_config.TextColumn("Item Number"),
+            "Part Number": st.column_config.TextColumn("Part Number"),
+            "Part Name": st.column_config.TextColumn("Part Name"),
+            "InStk": st.column_config.TextColumn("InStk"),
+        },
+        disabled=["Asset","Page","Item Number","Part Number","Part Name","InStk"],
+        key="cart_editor",
+    )
 
-        # Build the quote from the *saved* cart state (after saving qty)
-        # This keeps Generate as a one-click download.
-        cart_now = st.session_state.quote_cart.copy()
-        if not cart_now.empty and DOCX_AVAILABLE:
-            quote_blob = word_bytes_from_rows(cart_now, df, col_asset, col_model, col_serial)
-            base_name  = f"QuoteRequest_{sanitize_filename(str(sel_asset))}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
-            cg.download_button(
-                "Generate",
-                data=quote_blob,
-                file_name=base_name,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                use_container_width=True,
-                disabled=False
-            )
-        else:
-            cg.download_button(
-                "Generate",
-                data=b"",
-                file_name="QuoteRequest.docx",
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                use_container_width=True,
-                disabled=True
-            )
+    # Buttons on one line: Save • Remove Item • Clear • Generate (download)
+    cs, cr, cc, cg = st.columns([1.0, 1.4, 1.0, 1.3])
+    save_qty   = cs.button("Save", use_container_width=True)
+    remove_it  = cr.button("Remove Item", use_container_width=True)
+    clear_it   = cc.button("Clear", use_container_width=True)
 
+    # Apply actions
     if save_qty and "QTY" in edited_cart.columns:
         st.session_state.quote_cart.loc[edited_cart.index, "QTY"] = edited_cart["QTY"].values
         st.success("Saved quantities.")
@@ -421,6 +406,28 @@ else:
     if clear_it:
         st.session_state.quote_cart = st.session_state.quote_cart.iloc[0:0].copy()
         st.rerun()
+
+    # Generate uses the *current view* (edited values) so Save isn't required first
+    rows_for_quote = edited_cart.drop(columns=["Remove"], errors="ignore").copy()
+    if not rows_for_quote.empty and DOCX_AVAILABLE:
+        quote_blob = word_bytes_from_rows(rows_for_quote, df, col_asset, col_model, col_serial)
+        base_name  = f"QuoteRequest_{sanitize_filename(str(sel_asset))}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+        cg.download_button(
+            "Generate",
+            data=quote_blob,
+            file_name=base_name,
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+        )
+    else:
+        cg.download_button(
+            "Generate",
+            data=b"",
+            file_name="QuoteRequest.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+            disabled=True
+        )
 
 with st.expander("View raw cart data"):
     st.dataframe(st.session_state.quote_cart, hide_index=True, use_container_width=True)
