@@ -3,6 +3,7 @@
 import io, os, re
 from pathlib import Path
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -196,7 +197,8 @@ def load_data(_data_path: str, _sheet_name: str | None):
 def file_last_updated_label(path: Path) -> str:
     try:
         ts = path.stat().st_mtime
-        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+        dt_et = datetime.fromtimestamp(ts, tz=ZoneInfo("America/New_York"))
+        return dt_et.strftime("%Y-%m-%d %H:%M ") + dt_et.tzname()  # EST/EDT
     except Exception:
         return "unknown"
 
@@ -364,7 +366,6 @@ else:
     cart_view = cart_df.copy()
     cart_view.insert(0, "Remove", False)
 
-    # Editable cart (no form; avoids download_button-in-form error and lets Generate be on same row)
     edited_cart = st.data_editor(
         cart_view[["Remove","Asset","Page","Item Number","Part Number","Part Name","QTY","InStk"]],
         hide_index=True,
@@ -383,13 +384,35 @@ else:
         key="cart_editor",
     )
 
-    # Buttons on one line: Save • Remove Item • Clear • Generate (download)
-    cs, cr, cc, cg = st.columns([1.0, 1.4, 1.0, 1.3])
-    save_qty   = cs.button("Save", use_container_width=True)
-    remove_it  = cr.button("Remove Item", use_container_width=True)
-    clear_it   = cc.button("Clear", use_container_width=True)
+    # Buttons on one line: Remove (left) • [spacer] • Clear • Save • Generate (right-aligned & compact)
+    c_remove, c_spacer, c_clear, c_save, c_gen = st.columns([1.1, 6.5, 0.9, 0.9, 1.2])
+    remove_it = c_remove.button("Remove", use_container_width=True)
+    clear_it  = c_clear.button("Clear", use_container_width=True)
+    save_qty  = c_save.button("Save", use_container_width=True)
 
-    # Apply actions
+    # Generate uses the *current edited view* so Save isn't strictly required
+    rows_for_quote = edited_cart.drop(columns=["Remove"], errors="ignore").copy()
+    if not rows_for_quote.empty and DOCX_AVAILABLE:
+        quote_blob = word_bytes_from_rows(rows_for_quote, df, col_asset, col_model, col_serial)
+        base_name  = f"QuoteRequest_{sanitize_filename(str(sel_asset))}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
+        c_gen.download_button(
+            "Generate",
+            data=quote_blob,
+            file_name=base_name,
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+        )
+    else:
+        c_gen.download_button(
+            "Generate",
+            data=b"",
+            file_name="QuoteRequest.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            use_container_width=True,
+            disabled=True
+        )
+
+    # Apply actions after rendering buttons
     if save_qty and "QTY" in edited_cart.columns:
         st.session_state.quote_cart.loc[edited_cart.index, "QTY"] = edited_cart["QTY"].values
         st.success("Saved quantities.")
@@ -407,28 +430,6 @@ else:
         st.session_state.quote_cart = st.session_state.quote_cart.iloc[0:0].copy()
         st.rerun()
 
-    # Generate uses the *current view* (edited values) so Save isn't required first
-    rows_for_quote = edited_cart.drop(columns=["Remove"], errors="ignore").copy()
-    if not rows_for_quote.empty and DOCX_AVAILABLE:
-        quote_blob = word_bytes_from_rows(rows_for_quote, df, col_asset, col_model, col_serial)
-        base_name  = f"QuoteRequest_{sanitize_filename(str(sel_asset))}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"
-        cg.download_button(
-            "Generate",
-            data=quote_blob,
-            file_name=base_name,
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True,
-        )
-    else:
-        cg.download_button(
-            "Generate",
-            data=b"",
-            file_name="QuoteRequest.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True,
-            disabled=True
-        )
-
 with st.expander("View raw cart data"):
     st.dataframe(st.session_state.quote_cart, hide_index=True, use_container_width=True)
 
@@ -439,6 +440,7 @@ st.download_button("Download Current View (Excel)",
                    data=current_view_xlsx,
                    file_name=f"Parts_{sanitize_filename(str(sel_asset))}.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 
 
 
