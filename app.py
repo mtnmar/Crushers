@@ -23,6 +23,7 @@ st.title("Crushers Parts")
 # Try to import python-docx for Word export
 try:
     from docx import Document
+    from docx.shared import Pt
     DOCX_AVAILABLE = True
 except Exception:
     DOCX_AVAILABLE = False
@@ -87,19 +88,21 @@ def to_excel_bytes(dfout: pd.DataFrame, sheet_name="Parts") -> bytes:
 
 def word_bytes_from_rows(dfq: pd.DataFrame, df_all: pd.DataFrame,
                          col_asset: str, col_model: str | None, col_serial: str | None) -> bytes:
-    """Create a .docx with:
-       - Heading + Generated timestamp
-       - Assets table (Asset • Model • Serial) for all assets in dfq
-       - Parts table (NO Asset column): Page • Item Number • Part Number • Part Name • QTY
+    """
+    Create a .docx with:
+      - Heading + Generated timestamp
+      - Vendor (blank line)
+      - Asset header block (Asset • Model • Serial) for each asset in dfq (top of doc)
+      - Parts table: Part Number • Part Name • QTY  (+ 10 blank rows)
     """
     if not DOCX_AVAILABLE or dfq.empty:
         return b""
 
-    # Asset metadata table
+    # Build asset metadata from source sheet
     assets = pd.Series(sorted(dfq["Asset"].astype(str).unique().tolist()))
     meta_rows = []
     for a in assets:
-        row = { "Asset": a, "Model": "", "Serial": "" }
+        row = {"Asset": a, "Model": "", "Serial": ""}
         try:
             rows = df_all[df_all[col_asset].astype(str) == a]
             if not rows.empty:
@@ -110,45 +113,57 @@ def word_bytes_from_rows(dfq: pd.DataFrame, df_all: pd.DataFrame,
         meta_rows.append(row)
     meta_df = pd.DataFrame(meta_rows, columns=["Asset","Model","Serial"])
 
-    # Parts table (no Asset column)
-    cols_needed = ["Page","Item Number","Part Number","Part Name","QTY"]
-    df_parts = dfq.copy()
-    for c in cols_needed:
-        if c not in df_parts.columns:
-            df_parts[c] = ""
-    df_parts = df_parts[cols_needed]
+    # Parts table (only the 3 requested columns)
+    cols_needed = ["Part Number","Part Name","QTY"]
+    df_parts = pd.DataFrame(columns=cols_needed)
+    # dfq already has these renamed columns from the view
+    if not dfq.empty:
+        for c in cols_needed:
+            if c not in dfq.columns:
+                dfq[c] = ""
+        df_parts = dfq[cols_needed].copy()
+
+    # Add 10 blank rows for manual add-ons
+    df_parts = pd.concat(
+        [df_parts, pd.DataFrame([{"Part Number": "", "Part Name": "", "QTY": ""} for _ in range(10)])],
+        ignore_index=True
+    )
 
     # Build doc
     doc = Document()
+    try:
+        doc.styles["Normal"].font.name = "Calibri"
+        doc.styles["Normal"].font.size = Pt(10)
+    except Exception:
+        pass
+
     doc.add_heading("Quote Request", level=1)
     doc.add_paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    # Vendor left blank for users to fill in
+    doc.add_paragraph("Vendor: ______________________________")
 
-    # Assets section
+    # Asset block at top
     if not meta_df.empty:
-        doc.add_heading("Assets", level=2)
-        t = doc.add_table(rows=1, cols=3)
-        hdr = t.rows[0].cells
-        hdr[0].text = "Asset"; hdr[1].text = "Model"; hdr[2].text = "Serial"
+        doc.add_paragraph("")  # spacing
         for _, r in meta_df.iterrows():
-            cells = t.add_row().cells
-            cells[0].text = str(r["Asset"])
-            cells[1].text = str(r["Model"]) if pd.notna(r["Model"]) else ""
-            cells[2].text = str(r["Serial"]) if pd.notna(r["Serial"]) else ""
-        doc.add_paragraph("")
+            a = str(r["Asset"]) if pd.notna(r["Asset"]) else ""
+            m = str(r["Model"]) if pd.notna(r["Model"]) else ""
+            s = str(r["Serial"]) if pd.notna(r["Serial"]) else ""
+            doc.add_paragraph(f"Asset: {a}    Model: {m}    Serial: {s}")
 
-    # Parts section (no Asset column)
+    doc.add_paragraph("")  # spacing
     doc.add_heading("Requested Parts", level=2)
+
+    # Parts table (3 columns)
     t2 = doc.add_table(rows=1, cols=len(cols_needed))
     hdr2 = t2.rows[0].cells
     for i, col in enumerate(cols_needed):
         hdr2[i].text = col
     for _, r in df_parts.iterrows():
         cells = t2.add_row().cells
-        cells[0].text = str(r["Page"])
-        cells[1].text = str(r["Item Number"])
-        cells[2].text = str(r["Part Number"])
-        cells[3].text = str(r["Part Name"])
-        cells[4].text = str(r["QTY"])
+        cells[0].text = str(r["Part Number"]) if pd.notna(r["Part Number"]) else ""
+        cells[1].text = str(r["Part Name"])   if pd.notna(r["Part Name"]) else ""
+        cells[2].text = str(r["QTY"])         if pd.notna(r["QTY"]) else ""
 
     bio = io.BytesIO()
     doc.save(bio)
@@ -325,14 +340,66 @@ with c_cart2:
 with c_cart3:
     st.caption(f"Cart items: **{len(st.session_state.quote_cart)}**")
 
-with st.expander("View quote cart (internal Asset kept, not shown in quote rows)"):
+# ---- Editable Cart (change QTY, remove items) ----
+st.markdown("### Cart")
+cart_df = st.session_state.quote_cart.copy()
+
+if cart_df.empty:
+    st.caption("No items yet. Select rows above and click **Add selected to cart**.")
+else:
+    # Build a user-facing cart view; keep Asset internally but show for context
+    cart_view = cart_df.copy()
+    cart_view.insert(0, "Remove", False)
+
+    with st.form("cart_form", clear_on_submit=False):
+        edited_cart = st.data_editor(
+            cart_view[["Remove","Asset","Page","Item Number","Part Number","Part Name","QTY","InStk"]],
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Remove": st.column_config.CheckboxColumn("Remove", help="Check to remove selected rows"),
+                "QTY": st.column_config.NumberColumn("QTY", step=1, min_value=0),
+                "Asset": st.column_config.TextColumn("Asset"),
+                "Page": st.column_config.TextColumn("Page"),
+                "Item Number": st.column_config.TextColumn("Item Number"),
+                "Part Number": st.column_config.TextColumn("Part Number"),
+                "Part Name": st.column_config.TextColumn("Part Name"),
+                "InStk": st.column_config.TextColumn("InStk"),
+            },
+            disabled=["Asset","Page","Item Number","Part Number","Part Name","InStk"],
+            key="cart_editor",
+        )
+        c_s, c_r, c_c = st.columns([1.2, 1.2, 1.2])
+        save_qty = c_s.form_submit_button("💾 Save Qty", use_container_width=True)
+        remove_it = c_r.form_submit_button("🗑️ Remove selected", use_container_width=True)
+        clear_it  = c_c.form_submit_button("🧼 Clear cart", use_container_width=True)
+
+    if save_qty and "QTY" in edited_cart.columns:
+        # Persist QTY edits back to the session cart (align by index)
+        st.session_state.quote_cart.loc[edited_cart.index, "QTY"] = edited_cart["QTY"].values
+        st.success("Saved quantities.")
+
+    if remove_it:
+        try:
+            idx = edited_cart.index[edited_cart["Remove"] == True]
+        except Exception:
+            idx = []
+        if len(idx):
+            st.session_state.quote_cart = st.session_state.quote_cart.drop(index=idx).reset_index(drop=True)
+            st.rerun()
+
+    if clear_it:
+        st.session_state.quote_cart = st.session_state.quote_cart.iloc[0:0].copy()
+        st.rerun()
+
+with st.expander("View raw cart data"):
     st.dataframe(st.session_state.quote_cart, hide_index=True, use_container_width=True)
 
-# Build rows for export: prefer cart if not empty; else current selection
+# Build rows for export: prefer cart; else current selection
 rows_for_quote = st.session_state.quote_cart.copy() if not st.session_state.quote_cart.empty else sel_rows_now.copy()
 
 # ==================== Downloads ====================
-# 1) Generate Quote (Word) — one click .docx (NO Asset column in parts table)
+# 1) Generate Quote (Word) — .docx (Parts table = PN | Name | QTY; +10 blank rows; top shows Vendor blank + Asset/Model/Serial)
 if DOCX_AVAILABLE:
     word_bytes = word_bytes_from_rows(rows_for_quote, df, col_asset, col_model, col_serial) if not rows_for_quote.empty else b""
     base_name = f"QuoteRequest_{sanitize_filename(sel_asset)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
@@ -352,4 +419,5 @@ st.download_button("Download Current View (Excel)",
                    data=current_view_xlsx,
                    file_name=f"Parts_{sanitize_filename(sel_asset)}.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
 
