@@ -87,49 +87,57 @@ def to_excel_bytes(dfout: pd.DataFrame, sheet_name="Parts") -> bytes:
     bio.seek(0)
     return bio.getvalue()
 
+# ========= DOCX Export (updated to Mfr/Model/Serial + new columns) =========
 def word_bytes_from_rows(dfq: pd.DataFrame, df_all: pd.DataFrame,
                          col_asset: str, col_model: str | None, col_serial: str | None) -> bytes:
     """
     Create a .docx with:
       - Heading + Generated timestamp
       - Vendor placeholder line
-      - Asset header line(s): "Asset: ...    Model: ...    Serial: ..."
-      - Parts table: Part Number • Part Name • QTY  (+ 10 blank rows)
+      - Manufacturer/Model/Serial line(s) under Vendor (one per asset; skips blanks)
+      - Parts table: Page • Item • Part Number • Part Name • Qty (+ 10 blank rows)
     """
     if not DOCX_AVAILABLE or dfq.empty:
         return b""
 
-    # Unique, non-null assets from selected rows
+    # Figure out Manufacturer column name
+    mfr_col = pick_col(df_all, ["Manufacturer", "Mfr", "MFG", "Make", "Brand"])
+
+    # Collect unique, non-null assets from selected rows
     assets = sorted(dfq["Asset"].dropna().astype(str).unique().tolist())
 
-    # Pull Model/Serial for each asset from the full dataset
+    # Build per-asset meta rows; dedupe identical lines
+    meta_set = set()
     meta_rows = []
     for a in assets:
-        row = {"Asset": a, "Model": "", "Serial": ""}
+        mfr = model = serial = ""
         try:
             rows = df_all[df_all[col_asset].astype(str) == a]
             if not rows.empty:
-                if col_model and pd.notna(rows.iloc[0][col_model]):  row["Model"]  = str(rows.iloc[0][col_model])
-                if col_serial and pd.notna(rows.iloc[0][col_serial]): row["Serial"] = str(rows.iloc[0][col_serial])
+                if mfr_col and pd.notna(rows.iloc[0][mfr_col]):    mfr    = str(rows.iloc[0][mfr_col])
+                if col_model and pd.notna(rows.iloc[0][col_model]):  model  = str(rows.iloc[0][col_model])
+                if col_serial and pd.notna(rows.iloc[0][col_serial]): serial = str(rows.iloc[0][col_serial])
         except Exception:
             pass
-        meta_rows.append(row)
-    meta_df = pd.DataFrame(meta_rows, columns=["Asset","Model","Serial"])
+        trip = (mfr.strip(), model.strip(), serial.strip())
+        if any(trip) and trip not in meta_set:
+            meta_set.add(trip)
+            meta_rows.append({"Manufacturer": trip[0], "Model": trip[1], "Serial": trip[2]})
 
-    # Parts table (only the 3 requested columns)
-    cols_needed = ["Part Number","Part Name","QTY"]
-    df_parts = pd.DataFrame(columns=cols_needed)
-    if not dfq.empty:
-        for c in cols_needed:
-            if c not in dfq.columns:
-                dfq[c] = ""
-        df_parts = dfq[cols_needed].copy()
+    # Build parts table with requested columns
+    def col_or_blank(df: pd.DataFrame, name: str) -> pd.Series:
+        return df[name] if name in df.columns else pd.Series([""] * len(df), index=df.index)
+
+    parts = pd.DataFrame(index=dfq.index)
+    parts["Page"]         = col_or_blank(dfq, "Page").astype(str)
+    parts["Item"]         = col_or_blank(dfq, "Item Number").astype(str)
+    parts["Part Number"]  = col_or_blank(dfq, "Part Number").astype(str)
+    parts["Part Name"]    = col_or_blank(dfq, "Part Name").astype(str)
+    parts["Qty"]          = col_or_blank(dfq, "QTY").astype(str)
 
     # Add 10 blank rows for manual add-ons
-    df_parts = pd.concat(
-        [df_parts, pd.DataFrame([{"Part Number": "", "Part Name": "", "QTY": ""} for _ in range(10)])],
-        ignore_index=True
-    )
+    blanks = pd.DataFrame([{"Page": "", "Item": "", "Part Number": "", "Part Name": "", "Qty": ""} for _ in range(10)])
+    parts  = pd.concat([parts.reset_index(drop=True), blanks], ignore_index=True)
 
     # Build doc
     doc = Document()
@@ -142,34 +150,36 @@ def word_bytes_from_rows(dfq: pd.DataFrame, df_all: pd.DataFrame,
     doc.add_heading("Quote Request", level=1)
     doc.add_paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # Vendor line with placeholder
+    # Vendor placeholder
     p = doc.add_paragraph("Vendor: ")
     r = p.add_run("Enter vendor here")
     r.italic = True
 
-    # Asset header lines (no empties, no duplicates)
-    if not meta_df.empty:
+    # Manufacturer / Model / Serial lines (under vendor)
+    if meta_rows:
         doc.add_paragraph("")  # spacing
-        for _, r in meta_df.iterrows():
-            a = str(r["Asset"]) if pd.notna(r["Asset"]) and str(r["Asset"]).strip() else ""
-            m = str(r["Model"]) if pd.notna(r["Model"]) and str(r["Model"]).strip() else ""
-            s = str(r["Serial"]) if pd.notna(r["Serial"]) and str(r["Serial"]).strip() else ""
-            if a:
-                doc.add_paragraph(f"Asset: {a}    Model: {m}    Serial: {s}")
+        for row in meta_rows:
+            m = row.get("Manufacturer", "").strip()
+            mo = row.get("Model", "").strip()
+            se = row.get("Serial", "").strip()
+            doc.add_paragraph(f"Manufacturer: {m}    Model: {mo}    Serial: {se}")
 
     doc.add_paragraph("")  # spacing
     doc.add_heading("Requested Parts", level=2)
 
-    # Parts table (3 columns)
-    t2 = doc.add_table(rows=1, cols=len(cols_needed))
-    hdr2 = t2.rows[0].cells
-    for i, col in enumerate(cols_needed):
-        hdr2[i].text = col
-    for _, r in df_parts.iterrows():
-        cells = t2.add_row().cells
-        cells[0].text = str(r["Part Number"]) if pd.notna(r["Part Number"]) else ""
-        cells[1].text = str(r["Part Name"])   if pd.notna(r["Part Name"]) else ""
-        cells[2].text = str(r["QTY"])         if pd.notna(r["QTY"]) else ""
+    # Table with the 5 requested columns
+    cols = ["Page", "Item", "Part Number", "Part Name", "Qty"]
+    t = doc.add_table(rows=1, cols=len(cols))
+    hdr = t.rows[0].cells
+    for i, c in enumerate(cols):
+        hdr[i].text = c
+    for _, rr in parts.iterrows():
+        cells = t.add_row().cells
+        cells[0].text = rr["Page"]
+        cells[1].text = rr["Item"]
+        cells[2].text = rr["Part Number"]
+        cells[3].text = rr["Part Name"]
+        cells[4].text = rr["Qty"]
 
     bio = io.BytesIO()
     doc.save(bio)
@@ -384,7 +394,7 @@ else:
         key="cart_editor",
     )
 
-    # Buttons on one line: Remove (left) • [spacer] • Clear • Save • Generate (right-aligned & compact)
+    # Buttons on one line: Remove (left) • [spacer] • Clear • Save • Generate (right)
     c_remove, c_spacer, c_clear, c_save, c_gen = st.columns([1.1, 6.5, 0.9, 0.9, 1.2])
     remove_it = c_remove.button("Remove", use_container_width=True)
     clear_it  = c_clear.button("Clear", use_container_width=True)
