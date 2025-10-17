@@ -87,7 +87,7 @@ def to_excel_bytes(dfout: pd.DataFrame, sheet_name="Parts") -> bytes:
     bio.seek(0)
     return bio.getvalue()
 
-# ========= DOCX Export (updated to Mfr/Model/Serial + new columns) =========
+# ========= DOCX Export (includes 'Manufacture' key + new columns) =========
 def word_bytes_from_rows(dfq: pd.DataFrame, df_all: pd.DataFrame,
                          col_asset: str, col_model: str | None, col_serial: str | None) -> bytes:
     """
@@ -100,8 +100,8 @@ def word_bytes_from_rows(dfq: pd.DataFrame, df_all: pd.DataFrame,
     if not DOCX_AVAILABLE or dfq.empty:
         return b""
 
-    # Figure out Manufacturer column name
-    mfr_col = pick_col(df_all, ["Manufacturer", "Mfr", "MFG", "Make", "Brand"])
+    # Figure out Manufacturer column name (now includes 'Manufacture')
+    mfr_col = pick_col(df_all, ["Manufacture", "Manufacturer", "Mfr", "MFG", "Make", "Brand"])
 
     # Collect unique, non-null assets from selected rows
     assets = sorted(dfq["Asset"].dropna().astype(str).unique().tolist())
@@ -114,7 +114,7 @@ def word_bytes_from_rows(dfq: pd.DataFrame, df_all: pd.DataFrame,
         try:
             rows = df_all[df_all[col_asset].astype(str) == a]
             if not rows.empty:
-                if mfr_col and pd.notna(rows.iloc[0][mfr_col]):    mfr    = str(rows.iloc[0][mfr_col])
+                if mfr_col and pd.notna(rows.iloc[0][mfr_col]):      mfr    = str(rows.iloc[0][mfr_col])
                 if col_model and pd.notna(rows.iloc[0][col_model]):  model  = str(rows.iloc[0][col_model])
                 if col_serial and pd.notna(rows.iloc[0][col_serial]): serial = str(rows.iloc[0][col_serial])
         except Exception:
@@ -450,7 +450,5 @@ st.download_button("Download Current View (Excel)",
                    data=current_view_xlsx,
                    file_name=f"Parts_{sanitize_filename(str(sel_asset))}.xlsx",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-
 
 
